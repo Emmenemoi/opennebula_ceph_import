@@ -5,15 +5,16 @@ SOURCE_IMAGE=""
 DEST_IMAGE=""
 CEPH_ID="admin"
 LIVE=NO
-LIVE_INTERVAL=5 # 5 sec
+LIVE_INTERVAL=10 # 10 sec min downtime
 VERBOSE=YES
 ONE_USER="oneadmin"
 
 TARGET_NAME=""
-TARGET_DATASTORE=0
+TARGET_DATASTORE="0"
 
 CONFIG=""
 FORCE_FORMAT=""
+MAX_SYNC=10
 
 for i in "$@"
 do
@@ -77,7 +78,7 @@ if [[ $CONFIG ]]; then
 	source "$CONFIG"
 fi
 
-if [[ "$VERBOSE" == "YES" ]]; then
+#if [[ "$VERBOSE" == "YES" ]]; then
 	echo "ONE USER           = ${ONE_USER}"
 	echo "BRIDGE HOST        = ${BRIDGE_HOST}"
 	echo "SOURCE IMAGE       = ${SOURCE_IMAGE}"
@@ -90,12 +91,17 @@ if [[ "$VERBOSE" == "YES" ]]; then
 	if [[ "$LIVE" == "YES" ]]; then
 		echo "LIVE INTERVAL      = ${LIVE_INTERVAL}"
 	fi
-fi
+#fi
 
 
 if [[ -n $1 ]]; then
     echo "Last line of file specified as non-opt/last argument:"
     tail -1 $1
+fi
+
+read -n1 -r -p "Start ? (y/n)" key
+if [ ! "$key" == 'y' ]; then
+	exit
 fi
 
 SSH_PREFIX="sudo -u ${ONE_USER} ssh ${BRIDGE_HOST} "
@@ -105,6 +111,10 @@ cmd () {
 		printf "$1 \n" 1>&2
 	fi
 	$1
+}
+
+timestamp () {
+  date +"%s"
 }
 
 SYNC_ID=0
@@ -123,13 +133,13 @@ init_sync () {
 }
 
 diff_sync () {
-	NEXT=expr $SYNC_ID + 1
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${SOURCE_IMAGE}@ ${SYNC_PREFIX}${NEXT}"
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  export-diff --from-snap ${SYNC_PREFIX}${SYNC_ID} ${SOURCE_IMAGE}@ ${SYNC_PREFIX}${NEXT} - | rbd --id ${CEPH_ID}  import-diff - ${DEST_IMAGE}"
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${DEST_IMAGE}@${SYNC_PREFIX}${NEXT}"
+	NEXT=$(expr $SYNC_ID + 1)
+	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${SOURCE_IMAGE}@${SYNC_PREFIX}${NEXT}"
+	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  export-diff --from-snap ${SYNC_PREFIX}${SYNC_ID} ${SOURCE_IMAGE}@${SYNC_PREFIX}${NEXT} - | rbd --id ${CEPH_ID}  import-diff - ${DEST_IMAGE}"
+	#cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${DEST_IMAGE}@${SYNC_PREFIX}${NEXT}"
 
 	# clean older snaps
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${DEST_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
 	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${DEST_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
 
 	SYNC_ID=$NEXT
@@ -138,11 +148,40 @@ diff_sync () {
 SIZE=$(cmd "${SSH_PREFIX} rbd --id ${CEPH_ID} info ${SOURCE_IMAGE} | grep 'size' | cut -d ' ' -f2")
 
 printf "Initial sync of ${SOURCE_IMAGE} ($SIZE MB)\n"
+
 init_sync
 
+LAST_SYNC=$(expr $(timestamp) - $LIVE_INTERVAL - 10)
+while 	[ $(expr $(timestamp) - $LAST_SYNC) -gt "$LIVE_INTERVAL" ] && 
+		[ "$MAX_SYNC" -gt "0" ]; do
+	LAST_SYNC=$(timestamp)
+	MAX_SYNC=$(expr $MAX_SYNC - 1)
+	diff_sync
+done
 
-#oneimage create --name ${TARGET_NAME} --source ${DEST_IMAGE} --size $SIZE -d ${TARGET_DATASTORE}
+echo "Last sync took less than $LIVE_INTERVAL sec.\nIt is time to stop the I/O (VM) to do the last sync and be able to start the VM using the imported image.\n"
+read -n1 -r -p "I/O have been stopped? (y)" key
+while [ ! "$key" == 'y' ]; do
+	sleep 5;
+	read -n1 -r -p "I/O have been stopped? (y)" key
+done
 
+diff_sync
+
+printf "Add image in Opennebula\n"
+cmd "sudo -u ${ONE_USER} oneimage create --name ${TARGET_NAME} --source ${DEST_IMAGE} --size $SIZE -d ${TARGET_DATASTORE} --persistent"
+
+printf "Clean source snaps\n"
+for SNAP in $(cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap ls ${SOURCE_IMAGE} | grep -oP '${SYNC_PREFIX}\d+' | sort")
+do
+	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@$SNAP"
+done
+
+printf "Clean dest snaps\n"
+for SNAP in $(cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap ls ${DEST_IMAGE} | grep -oP '${SYNC_PREFIX}\d+' | sort")
+do
+	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${DEST_IMAGE}@$SNAP"
+done
 
 
 
