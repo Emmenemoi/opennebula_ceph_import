@@ -1,5 +1,5 @@
 
-## UNDER DEVEVELOPMENT ##
+## UNDER DEVELOPMENT ##
 
 # Virtual Ceph images import
 
