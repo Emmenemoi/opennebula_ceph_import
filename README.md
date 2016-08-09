@@ -1,3 +1,6 @@
+
+## UNDER DEVEVELOPMENT ##
+
 # Virtual Ceph images import
 
 Import existing images (rbd, lvm or zfs) from one source to rbd image (raw or cinder), using diff with rbd or rsync.
