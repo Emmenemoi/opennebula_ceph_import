@@ -134,13 +134,18 @@ if [[ $CONFIG ]]; then
 	source "$CONFIG"
 fi
 
+	if [[ $SOURCE_IMAGE == "/dev/"* ]]; then
+		SOURCE_TYPE="local"
+	fi
 #if [[ "$VERBOSE" == "YES" ]]; then
 	if [[ "$SOURCE_TYPE" == "local" ]]; then
 		IMPORT_TOOL="rsync"
 		
 		# define LOCAL_SOURCE_TOOL
 		if [[ $SOURCE_IMAGE == *"/zvol/"* ]]; then
-		  LOCAL_SOURCE_TOOL="zfs";
+			LOCAL_SOURCE_TOOL="zfs";
+			ZFS_SOURCE_IMAGE=${SOURCE_IMAGE/\/dev\/zvol\//}
+			SOURCE_POOL=${ZFS_SOURCE_IMAGE%%/*}
 		else
 			if lvdisplay | grep -q $SOURCE_IMAGE; then
 		  		LOCAL_SOURCE_TOOL="lvm";
@@ -148,22 +153,33 @@ fi
 			else
 				echo not found
 			fi
+			SOURCE_POOL=${SOURCE_IMAGE/\/dev\//}
+			SOURCE_POOL=${SOURCE_POOL%%/*}
 		fi
-
+	else
+		SOURCE_POOL=${SOURCE_IMAGE%%/*}
 	fi
+
 	if [[ "$IMPORT_DEST" == "xenserver" ]]; then
 		echo "TARGET SR UUID     = ${TARGET_SR_UUID}"
 		echo "TARGET VDI UUID    = ${TARGET_VDI_UUID}"
 		DEST_IMAGE="${XS_SR_PREFIX}${TARGET_SR_UUID}/${XS_VDI_PREFIX}${TARGET_VDI_UUID}"
 	fi
 
+	DEST_POOL=${DEST_IMAGE%%/*}
+
 	echo "SSH USER           = ${SSH_USER}"
 	echo "BRIDGE HOST        = ${BRIDGE_HOST}"
+	echo "SOURCE POOL        = ${SOURCE_POOL}"
 	echo "SOURCE IMAGE       = ${SOURCE_IMAGE}"
+	echo "DESTINATION POOL   = ${DEST_POOL}"
 	echo "DESTINATION IMAGE  = ${DEST_IMAGE}"
 	echo "CEPHX ID           = ${CEPH_ID}"
 	echo "LIVE SYNC          = ${LIVE}"
 	echo "IMPORT TOOL        = ${IMPORT_TOOL}"
+	if [[ "$SOURCE_TYPE" == "local" ]]; then
+	echo "LOCAL SOURCE TOOL  = ${LOCAL_SOURCE_TOOL}"
+	fi
 	echo "FSFREEZE HOST      = ${FSFREEZE_HOST}"
 	echo "FSFREEZE HOST KEY  = ${FSFREEZE_HOST_KEY}"
 	echo "TARGET NAME        = ${TARGET_NAME}"
@@ -216,12 +232,15 @@ timestamp () {
 
 SYNC_ID=0
 SYNC_PREFIX="virt-sync-"
-SOURCE_POOL=${SOURCE_IMAGE%%/*}
-DEST_POOL=${DEST_IMAGE%%/*}
 IMPORT_DEV_DIR="/dev/imports"
 
 ######## INIT VARS FUNCTION #######
-cmd "$SSH_PREFIX mkdir -p ${IMPORT_DEV_DIR}/${SOURCE_POOL}"
+if [[ "$SOURCE_TYPE" == "local" ]]; then
+	SOURCE_POOL_DIR=$(cmd "dirname ${SOURCE_IMAGE}")
+	cmd "mkdir -p ${IMPORT_DEV_DIR}/${SOURCE_POOL_DIR}"
+else
+	cmd "$SSH_PREFIX mkdir -p ${IMPORT_DEV_DIR}/${SOURCE_POOL}"
+fi
 cmd "$SSH_PREFIX mkdir -p ${IMPORT_DEV_DIR}/${DEST_POOL}"
 
 init_vars () {
@@ -254,6 +273,32 @@ quiesced_rbd_map () {
 		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -u /"
 	fi
 	S_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} --read-only ${image}@${SYNC_PREFIX}${SYNC_ID}")
+}
+
+quiesced_zfs_map () {
+	if [ -z "$1" ]                           # Is parameter #1 zero length?
+	then
+		echo "-Parameter #1/source image name is zero length.-"  # Or no parameter passed.
+		return
+	else
+		local image=$1
+		image=${image/\/dev\/zvol\//}
+	fi
+	if [ -z "$2" ]                           # Is parameter #1 zero length?
+	then
+		echo "-Parameter #2/fsfreeze host is zero length: Can't freeze fs."  # Or no parameter passed.
+	fi
+	local host=$2
+	if [ ! -z "$host" ]; then
+		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -f /"
+	fi
+	cmd "zfs snapshot ${image}@${SYNC_PREFIX}${SYNC_ID}"
+	if [ ! -z "$host" ]; then
+		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -u /"
+	fi
+	cmd "zfs clone ${image}@${SYNC_PREFIX}${SYNC_ID} ${SOURCE_POOL}/vm-export"
+	sleep 1
+	S_DEV_PATH="/dev/zvol/${SOURCE_POOL}/vm-export"
 }
 
 finalize_setup () {
@@ -303,16 +348,26 @@ rbd_init_sync () {
 }
 
 rsync_init_sync () {
-		cmd "$SSH_PREFIX mkdir -p /mnt/source"
+
 		cmd "$SSH_PREFIX mkdir -p /mnt/destination"
 		if [[ "$SOURCE_TYPE" == "local" ]]; then
-			S_DEV_PATH="${SOURCE_IMAGE}"
+			case "$LOCAL_SOURCE_TOOL" in
+				"zfs")
+					quiesced_zfs_map ${SOURCE_IMAGE} ${FSFREEZE_HOST}
+					;;
+			esac
+			cmd "mkdir -p /mnt/source"
+			cmd "mount ${S_DEV_PATH} /mnt/source"
+			cmd "ln -s ${S_DEV_PATH} ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
 		else
+			cmd "$SSH_PREFIX mkdir -p /mnt/source"
 			#cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
 			#S_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} --read-only ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}")
 			quiesced_rbd_map ${SOURCE_IMAGE} ${FSFREEZE_HOST}
+			cmd "$SSH_PREFIX mount ${S_DEV_PATH} /mnt/source"
 			cmd "$SSH_PREFIX ln -s ${S_DEV_PATH} ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
 		fi
+		
 		if [[ ! "$EXISTS" == "YES" ]]; then
 			SIZE=$(expr ${SIZE} + 500)
 			cmd "$SSH_PREFIX rbd --id ${CEPH_ID} create -s ${SIZE}B ${FORCE_FORMAT} ${OBJECT_SIZE_OPT} ${DEST_IMAGE}"
@@ -332,7 +387,7 @@ rsync_init_sync () {
 			cmd "$SSH_PREFIX parted --script ${D_DEV_PATH} disk_set pmbr_boot on"
 			cmd "$SSH_PREFIX parted --script ${D_DEV_PATH} align-check optimal 2"
 		fi
-		cmd "$SSH_PREFIX mount ${S_DEV_PATH} /mnt/source"
+
 		D_DEV_PART=$(cmd "$SSH_PREFIX kpartx -avs ${D_DEV_PATH} | grep -i '[nr]bd.*p2' | cut -d ' ' -f3")
 		D_DM_PATH="/dev/mapper/${D_DEV_PART}"
 		if [[ ! "$EXISTS" == "YES" ]]; then
@@ -401,16 +456,32 @@ rbd_diff_sync () {
 }
 
 rsync_diff_sync () {
-	cmd "$SSH_PREFIX umount /mnt/source"
-	cmd "$SSH_PREFIX ${RBD_MODE} unmap ${S_DEV_PATH}"
-	cmd "$SSH_PREFIX unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
-	quiesced_rbd_map ${SOURCE_IMAGE} ${FSFREEZE_HOST}
-#	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
-#	S_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} --read-only ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}")
-	cmd "$SSH_PREFIX ln -s ${S_DEV_PATH} ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
-	cmd "$SSH_PREFIX mount ${S_DEV_PATH} /mnt/source"
-	cmd "$SSH_PREFIX rsync -avx --delete /mnt/source/ /mnt/destination/"
+
+	if [[ "$SOURCE_TYPE" == "local" ]]; then
+		cmd "umount /mnt/source"
+		cmd "unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		case "$LOCAL_SOURCE_TOOL" in
+			"zfs")
+				cmd "zfs destroy ${SOURCE_POOL}/vm-export"
+				cmd "zfs destroy ${ZFS_SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+				quiesced_zfs_map ${SOURCE_IMAGE} ${FSFREEZE_HOST}
+				;;
+		esac
+		cmd "ln -s ${S_DEV_PATH} ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		cmd "mount ${S_DEV_PATH} /mnt/source"
+		cmd "rsync -avx --delete /mnt/source/ ${BRIDGE_HOST}:/mnt/destination/"
+	else
+		cmd "$SSH_PREFIX umount /mnt/source"
+		cmd "$SSH_PREFIX unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		cmd "$SSH_PREFIX ${RBD_MODE} unmap ${S_DEV_PATH}"
+		cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+		quiesced_rbd_map ${SOURCE_IMAGE} ${FSFREEZE_HOST}
+	#	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+	#	S_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} --read-only ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}")
+		cmd "$SSH_PREFIX ln -s ${S_DEV_PATH} ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		cmd "$SSH_PREFIX mount ${S_DEV_PATH} /mnt/source"
+		cmd "$SSH_PREFIX rsync -avx --delete /mnt/source/ /mnt/destination/"
+	fi
 }
 
 dd_diff_sync () {
@@ -433,14 +504,26 @@ rbd_clean_sync () {
 }
 
 rsync_clean_sync () {
-	cmd "$SSH_PREFIX umount /mnt/source"
 	cmd "$SSH_PREFIX umount /mnt/destination"
 	cmd "$SSH_PREFIX kpartx -ds ${D_DEV_PATH}"
-	cmd "$SSH_PREFIX unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
-	cmd "$SSH_PREFIX ${RBD_MODE} unmap ${S_DEV_PATH}"
+
+	if [[ "$SOURCE_TYPE" == "local" ]]; then
+		cmd "umount /mnt/source"
+		cmd "unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		case "$LOCAL_SOURCE_TOOL" in
+			"zfs")
+				cmd "zfs destroy ${SOURCE_POOL}/vm-export"
+				cmd "zfs destroy ${ZFS_SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+				;;
+		esac
+	else
+		cmd "$SSH_PREFIX umount /mnt/source"
+		cmd "$SSH_PREFIX unlink ${IMPORT_DEV_DIR}/${SOURCE_IMAGE}"
+		cmd "$SSH_PREFIX ${RBD_MODE} unmap ${S_DEV_PATH}"
+		cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
+	fi	
 	cmd "$SSH_PREFIX unlink ${IMPORT_DEV_DIR}/${DEST_IMAGE}"
 	cmd "$SSH_PREFIX ${RBD_MODE} unmap ${D_DEV_PATH}"
-	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap rm ${SOURCE_IMAGE}@${SYNC_PREFIX}${SYNC_ID}"
 }
 
 dd_clean_sync () {
@@ -494,7 +577,18 @@ else
 		EXISTS=NO
 	fi
 
-	SIZE=$(cmd "${SSH_PREFIX} rbd --id ${CEPH_ID} info ${SOURCE_IMAGE} --format json | grep -Po '(?<=\"size\":)[^,\"]*'")
+	# check size
+	if [[ "$SOURCE_TYPE" == "local" ]]; then
+		case "$LOCAL_SOURCE_TOOL" in
+			"zfs")
+			#SIZE=$(cmd "zfs list -p | grep '${ZFS_SOURCE_IMAGE}' | tr -s ' ' | cut -d ' ' -f2")
+			SIZE=$(cmd "zfs list -pH -o used ${ZFS_SOURCE_IMAGE}")
+			;;
+		esac
+	else
+		SIZE=$(cmd "${SSH_PREFIX} rbd --id ${CEPH_ID} info ${SOURCE_IMAGE} --format json | grep -Po '(?<=\"size\":)[^,\"]*'")
+	fi
+	
 	printf "Initial sync of ${SOURCE_IMAGE} ($SIZE B)\n"
 
 	case "$IMPORT_TOOL" in
@@ -531,8 +625,23 @@ else
 	done
 
 	printf "Last sync took less than $LIVE_INTERVAL sec.\nIt is time to stop the I/O (VM) to do the last sync and be able to start the VM using the imported image.\n"
-	read -n1 -r -p "I/O have been stopped? (y)" key
+	read -n1 -r -p "I/O have been stopped? (y/c) - c for cancel and clean" key
 	printf "\n"
+	if [ "$key" == 'c' ]; then
+		case "$IMPORT_TOOL" in
+			"rsync")
+				rsync_clean_sync
+				;;
+			"dd")
+				dd_clean_sync
+				;;
+			*)
+				rbd_clean_sync
+				;;
+		esac
+		exit 1
+	fi
+
 	while [ ! "$key" == 'y' ]; do
 		sleep 5;
 		read -n1 -r -p "I/O have been stopped? (y)" key
