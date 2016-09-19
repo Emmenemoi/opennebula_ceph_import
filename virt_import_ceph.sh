@@ -582,7 +582,7 @@ else
 		case "$LOCAL_SOURCE_TOOL" in
 			"zfs")
 			#SIZE=$(cmd "zfs list -p | grep '${ZFS_SOURCE_IMAGE}' | tr -s ' ' | cut -d ' ' -f2")
-			SIZE=$(cmd "zfs list -pH -o used ${ZFS_SOURCE_IMAGE}")
+			SIZE=$(cmd "zfs list -pH -o usedbydataset ${ZFS_SOURCE_IMAGE}")
 			;;
 		esac
 	else
