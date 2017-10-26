@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 # For opennebula: use oneadmin as SSH_USER
 
@@ -214,9 +214,16 @@ else
 fi
 
 if [[ "$BRIDGE_HOST" == "" ]]; then
-	SSH_PREFIX="${SUDO_PREFIX} "
+	SSH_PREFIX="${SUDO_PREFIX}"
 else
 	SSH_PREFIX="${SUDO_PREFIX}ssh ${BRIDGE_HOST} "
+fi
+
+if [ ! -z "$FSFREEZE_HOST" ]; then
+	xl list $FSFREEZE_HOST
+	FSFREEZE_HOST_IS_LOCAL_VM=$?
+else
+	FSFREEZE_HOST_IS_LOCAL_VM=1
 fi
 
 cmd () {
@@ -265,11 +272,16 @@ quiesced_rbd_map () {
 		echo "-Parameter #2/fsfreeze host is zero length: Can't freeze fs."  # Or no parameter passed.
 	fi
 	local host=$2
-	if [ ! -z "$host" ]; then
+	local vm=$2
+	if [ $FSFREEZE_HOST_IS_LOCAL_VM -eq 0 ]; then
+		cmd "xl pause $vm"
+	elif [ ! -z "$host" ]; then
 		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -f /"
 	fi
 	cmd "$SSH_PREFIX rbd --id ${CEPH_ID}  snap create ${image}@${SYNC_PREFIX}${SYNC_ID}"
-	if [ ! -z "$host" ]; then
+	if [ $FSFREEZE_HOST_IS_LOCAL_VM -eq 0 ]; then
+		cmd "xl unpause $vm"
+	elif [ ! -z "$host" ]; then
 		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -u /"
 	fi
 	S_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} --read-only ${image}@${SYNC_PREFIX}${SYNC_ID}")
@@ -289,11 +301,16 @@ quiesced_zfs_map () {
 		echo "-Parameter #2/fsfreeze host is zero length: Can't freeze fs."  # Or no parameter passed.
 	fi
 	local host=$2
-	if [ ! -z "$host" ]; then
+	local vm=$2
+	if [ $FSFREEZE_HOST_IS_LOCAL_VM -eq 0 ]; then
+		cmd "xl pause $vm"
+	elif [ ! -z "$host" ]; then
 		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -f /"
 	fi
 	cmd "zfs snapshot ${image}@${SYNC_PREFIX}${SYNC_ID}"
-	if [ ! -z "$host" ]; then
+	if [ $FSFREEZE_HOST_IS_LOCAL_VM -eq 0 ]; then
+		cmd "xl unpause $vm"
+	elif [ ! -z "$host" ]; then
 		cmd "${SUDO_PREFIX}ssh -i ${FSFREEZE_HOST_KEY} $host fsfreeze -u /"
 	fi
 	cmd "zfs clone ${image}@${SYNC_PREFIX}${SYNC_ID} ${SOURCE_POOL}/vm-export"
@@ -320,17 +337,17 @@ finalize_setup () {
 
 	printf "#######################################################################\n"
 	printf "Or execute manually:\n"
-	printf "xe vm-param-set HVM-boot-policy='' uuid=\n"
-	printf "xe vm-param-set PV-bootloader='pygrub' uuid=\n"
-	printf "xe vm-param-set PV-bootloader-args='--offset=${OBJECT_SIZE}' uuid=\n"
-	printf "xe vm-param-set PV-args='root=UUID=${DEVUUID}' uuid=\n"
+	printf "xe vm-param-set HVM-boot-policy='' uuid=\$VMUUID\n"
+	printf "xe vm-param-set PV-bootloader='pygrub' uuid=\$VMUUID\n"
+	printf "xe vm-param-set PV-bootloader-args='--offset=${OBJECT_SIZE}' uuid=\$VMUUID\n"
+	printf "xe vm-param-set PV-args='root=UUID=${DEVUUID}' uuid=\$VMUUID\n"
 	printf "Plug XS guest tools !\n"
 	printf "Then inside boot:\n"
 	printf "sed -r -i.bak 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 hpet=disable\"/' /etc/default/grub\n"
 	printf "update-grub2\n"
 	printf "grub-install --modules=part_gpt /dev/xvda\n"
 	printf "=> VERIFY /etc/fstab\n"
-	printf "xe vm-param-set HVM-boot-policy='BIOS order' uuid=\n"
+	printf "xe vm-param-set HVM-boot-policy='BIOS order' uuid=\$VMUUID\n"
 }
 
 ######### INIT SYNC FUNCTIONS #########
@@ -370,7 +387,8 @@ rsync_init_sync () {
 		
 		if [[ ! "$EXISTS" == "YES" ]]; then
 			SIZE=$(expr ${SIZE} + 500)
-			cmd "$SSH_PREFIX rbd --id ${CEPH_ID} create -s ${SIZE}B ${FORCE_FORMAT} ${OBJECT_SIZE_OPT} ${DEST_IMAGE}"
+			SIZE=$(expr ${SIZE} / 1024000)
+			cmd "$SSH_PREFIX rbd --id ${CEPH_ID} create --size ${SIZE} ${FORCE_FORMAT} ${OBJECT_SIZE_OPT} ${DEST_IMAGE}"
 		fi
 		D_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} ${DEST_IMAGE}")
 		cmd "$SSH_PREFIX ln -s ${D_DEV_PATH} ${IMPORT_DEV_DIR}/${DEST_IMAGE}"
@@ -416,7 +434,8 @@ dd_init_sync () {
 		fi
 		if [[ ! "$EXISTS" == "YES" ]]; then
 			SIZE=$(expr ${SIZE} + 500)
-			cmd "$SSH_PREFIX rbd --id ${CEPH_ID} create -s ${SIZE}B ${FORCE_FORMAT} ${OBJECT_SIZE_OPT} ${DEST_IMAGE}"
+			SIZE=$(expr ${SIZE} / 1024000)
+			cmd "$SSH_PREFIX rbd --id ${CEPH_ID} create --size ${SIZE} ${FORCE_FORMAT} ${OBJECT_SIZE_OPT} ${DEST_IMAGE}"
 		fi
 		D_DEV_PATH=$(cmd "$SSH_PREFIX ${RBD_MODE} map --id ${CEPH_ID} ${DEST_IMAGE}")
 		cmd "$SSH_PREFIX ln -s ${D_DEV_PATH} ${IMPORT_DEV_DIR}/${DEST_IMAGE}"
@@ -436,7 +455,7 @@ dd_init_sync () {
 
 		D_DEV_PART=$(cmd "$SSH_PREFIX kpartx -avs ${D_DEV_PATH} | grep -i '[nr]bd.*p2' | cut -d ' ' -f3")
 		D_DM_PATH="/dev/mapper/${D_DEV_PART}"
-		cmd "$SSH_PREFIX dd if=${S_DEV_PATH} of=${D_DM_PATH} bs=${OBJECT_SIZE} status=progress"
+		cmd "$SSH_PREFIX dd if=${S_DEV_PATH} of=${D_DM_PATH} bs=${OBJECT_SIZE} conv=fdatasync status=progress"
 		cmd "$SSH_PREFIX mount ${D_DM_PATH} /mnt/destination"
 		
 }
@@ -485,7 +504,7 @@ rsync_diff_sync () {
 }
 
 dd_diff_sync () {
-	printf "Nothing to do...\n"
+	printf "Nothing to do using dd... and can't rsync beacause of mount pb.\n"
 }
 
 ######### CLEAN SYNC FUNCTIONS #########
@@ -552,7 +571,7 @@ if [[ "$CLEAN_ONLY" == "YES" ]]; then
 else
 
 	# check FSFREEZE host conenction
-	if [ ! -z "$FSFREEZE_HOST" ]                           # Is parameter #1 zero length?
+	if [ ! -z "$FSFREEZE_HOST" && $FSFREEZE_HOST_IS_LOCAL_VM -neq 0 ]                           # Is parameter #1 zero length?
 	then
 		echo "Check $FSFREEZE_HOST connectivity"  # Or no parameter passed.
 		status=$(ssh -i ${FSFREEZE_HOST_KEY} -o BatchMode=yes -o ConnectTimeout=5 ${SSH_USER}@${FSFREEZE_HOST} echo ok 2>&1)
@@ -586,7 +605,7 @@ else
 			;;
 		esac
 	else
-		SIZE=$(cmd "${SSH_PREFIX} rbd --id ${CEPH_ID} info ${SOURCE_IMAGE} --format json | grep -Po '(?<=\"size\":)[^,\"]*'")
+		SIZE=$(cmd "${SSH_PREFIX} rbd --format json --id ${CEPH_ID} info ${SOURCE_IMAGE} | grep -Po '(?<=\"size\":)[^,\"]*'")
 	fi
 	
 	printf "Initial sync of ${SOURCE_IMAGE} ($SIZE B)\n"
